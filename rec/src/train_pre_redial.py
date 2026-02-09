@@ -19,6 +19,38 @@ from evaluate_rec import RecEvaluator
 from model_gpt2 import PromptGPT2forCRS
 from config import gpt2_special_tokens_dict, prompt_special_tokens_dict
 from model_prompt import MMPrompt
+import re
+from pathlib import Path
+import signal
+
+_should_exit = False
+
+def _sigusr1_handler(signum, frame):
+    global _should_exit
+    _should_exit = True
+
+signal.signal(signal.SIGUSR1, _sigusr1_handler)
+
+def get_latest_ckpt(output_dir: str):
+    p = Path(output_dir)
+    ckpts = sorted(p.glob("ckpt-step-*"), key=lambda x: int(x.name.split("-")[-1]))
+    return str(ckpts[-1]) if ckpts else None
+
+def rotate_checkpoints(output_dir: str, save_total_limit: int):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+    p = Path(output_dir)
+    ckpts = sorted(p.glob("ckpt-step-*"), key=lambda x: int(x.name.split("-")[-1]))
+    if len(ckpts) <= save_total_limit:
+        return
+    for d in ckpts[:-save_total_limit]:
+        for child in d.rglob("*"):
+            if child.is_file():
+                child.unlink()
+        for child in sorted(d.rglob("*"), reverse=True):
+            if child.is_dir():
+                child.rmdir()
+        d.rmdir()
 
 
 def parse_args():
@@ -51,6 +83,12 @@ def parse_args():
     parser.add_argument("--project", type=str, help="wandb exp project")
     parser.add_argument("--name", type=str, help="wandb exp name")
     parser.add_argument("--log_all", action="store_true", help="log in all processes, otherwise only in rank0")
+    parser.add_argument("--resume_from", type=str, default=None,
+            help="Path to a checkpoint dir (or 'latest').")
+    parser.add_argument("--save_steps", type=int, default=1000,
+        help="Save checkpoint every N optimizer steps.")
+    parser.add_argument("--save_total_limit", type=int, default=3,
+        help="Keep only the last N checkpoints.")
     args = parser.parse_args()
     return args
 
@@ -177,22 +215,45 @@ if __name__ == '__main__':
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
+    # compute steps first (needs train_dataloader length, so do dataloaders before scheduler)
+    # ... (keep your dataloader creation code)
 
-    evaluator = RecEvaluator()
-    prompt_encoder, optimizer, train_dataloader, valid_dataloader, test_dataloader = accelerator.prepare(
-        prompt_encoder, optimizer, train_dataloader, valid_dataloader, test_dataloader
-    )
-    # step, epoch, batch size
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     else:
         args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    completed_steps = 0
-    # lr_scheduler
+
     lr_scheduler = get_linear_schedule_with_warmup(optimizer, args.num_warmup_steps, args.max_train_steps)
-    lr_scheduler = accelerator.prepare(lr_scheduler)
+
+    prompt_encoder, optimizer, lr_scheduler, train_dataloader, valid_dataloader, test_dataloader = accelerator.prepare(
+        prompt_encoder, optimizer, lr_scheduler, train_dataloader, valid_dataloader, test_dataloader
+    )
+    completed_steps = 0
+    start_epoch = 0
+
+    # ---- RESUME ----
+    if args.resume_from is not None:
+        if args.resume_from == "latest":
+            ckpt_path = get_latest_ckpt(args.output_dir)
+        else:
+            ckpt_path = args.resume_from
+
+        if ckpt_path is None:
+            logger.info("resume_from=latest but no checkpoint found; starting fresh.")
+        else:
+            logger.info(f"Resuming from checkpoint: {ckpt_path}")
+            accelerator.load_state(ckpt_path)
+
+            # restore counters we saved
+            meta_path = os.path.join(ckpt_path, "trainer_state.pt")
+            if os.path.exists(meta_path):
+                meta = torch.load(meta_path, map_location="cpu")
+                completed_steps = int(meta.get("completed_steps", 0))
+                start_epoch = int(meta.get("epoch", 0))
+            logger.info(f"Resumed at epoch={start_epoch}, completed_steps={completed_steps}")
+
+
     # training info
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -203,6 +264,10 @@ if __name__ == '__main__':
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.update(completed_steps)
+
+    for epoch in range(start_epoch, args.num_train_epochs):
 
     # save model with best metric
     metric, mode = 'loss', -1
@@ -239,12 +304,45 @@ if __name__ == '__main__':
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 if args.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(prompt_encoder.parameters(), args.max_grad_norm)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
                 progress_bar.update(1)
                 completed_steps += 1
+
+                # Graceful stop on Slurm signal
+                if _should_exit:
+                    if accelerator.is_local_main_process:
+                        ckpt_dir = os.path.join(args.output_dir, f"ckpt-step-{completed_steps}-sigusr1")
+                        os.makedirs(ckpt_dir, exist_ok=True)
+                        accelerator.save_state(ckpt_dir)
+                        torch.save(
+                                {"completed_steps": completed_steps, "epoch": epoch},
+                                os.path.join(ckpt_dir, "trainer_state.pt"),
+                                )
+                        logger.info("SIGUSR1 received: checkpoint saved, exiting.")
+
+                    accelerator.wait_for_everyone()
+                    sys.exit(0)
+
+                # Periodic checkpointing
+                if accelerator.is_local_main_process and (completed_steps % args.save_steps == 0):
+                    ckpt_dir = os.path.join(args.output_dir, f"ckpt-step-{completed_steps}")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+
+                    accelerator.save_state(ckpt_dir)
+                    torch.save(
+                            {"completed_steps": completed_steps, "epoch": epoch},
+                            os.path.join(ckpt_dir, "trainer_state.pt"),
+                            )
+
+                    rotate_checkpoints(args.output_dir, args.save_total_limit)
+                    logger.info(f"Saved checkpoint to {ckpt_dir}")
+
+                accelerator.wait_for_everyone()
+
                 if run:
                     run.log({'loss': np.mean(train_loss) * args.gradient_accumulation_steps})
 
