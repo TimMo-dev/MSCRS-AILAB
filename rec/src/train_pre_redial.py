@@ -113,8 +113,8 @@ if __name__ == '__main__':
     )
 
     co = Co_occurrence(dataset=args.dataset, split='train', debug=args.debug ,all_items = kg['item_ids'],entity_max_length=args.entity_max_length,n_entity=kg['num_entities'] ).get_entity_co_info()
-    text_simi  = text_sim(pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
-    image_simi = image_sim(pad_entity_id=kg['pad_entity_id']).get_entity_is_info()
+    text_simi  = text_sim(args.dataset,pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
+    image_simi = image_sim(args.dataset,pad_entity_id=kg['pad_entity_id']).get_entity_is_info()
 
     valid_dataset = CRSDataset(
         dataset=args.dataset, split='valid', tokenizer=tokenizer, debug=args.debug, max_length=args.max_length,
@@ -338,3 +338,4 @@ if __name__ == '__main__':
     os.makedirs(final_dir, exist_ok=True)
     prompt_encoder.save(final_dir)
     logger.info(f'save final model')
+

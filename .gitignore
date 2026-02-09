@@ -1,0 +1,4 @@
+*.sif
+hf_models/
+*.pyc
+*/__pycache__/*
