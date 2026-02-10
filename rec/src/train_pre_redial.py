@@ -33,14 +33,28 @@ signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
 def get_latest_ckpt(output_dir: str):
     p = Path(output_dir)
-    ckpts = sorted(p.glob("ckpt-step-*"), key=lambda x: int(x.name.split("-")[-1]))
-    return str(ckpts[-1]) if ckpts else None
+    best = None
+    best_step = -1
+    for d in p.glob("ckpt-step-*"):
+        m = re.search(r"ckpt-step-(\d+)", d.name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if step > best_step:
+            best_step = step
+            best = d
+    return str(best) if best else None
+
+def _ckpt_step(path: Path) -> int:
+    m = re.search(r"ckpt-step-(\d+)", path.name)
+    return int(m.group(1)) if m else -1
 
 def rotate_checkpoints(output_dir: str, save_total_limit: int):
     if save_total_limit is None or save_total_limit <= 0:
         return
     p = Path(output_dir)
-    ckpts = sorted(p.glob("ckpt-step-*"), key=lambda x: int(x.name.split("-")[-1]))
+    ckpts = sorted(p.glob("ckpt-step-*"), key=_ckpt_step)
+    ckpts = [c for c in ckpts if _ckpt_step(c) >= 0]
     if len(ckpts) <= save_total_limit:
         return
     for d in ckpts[:-save_total_limit]:
@@ -51,7 +65,6 @@ def rotate_checkpoints(output_dir: str, save_total_limit: int):
             if child.is_dir():
                 child.rmdir()
         d.rmdir()
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -253,7 +266,7 @@ if __name__ == '__main__':
                 start_epoch = int(meta.get("epoch", 0))
             logger.info(f"Resumed at epoch={start_epoch}, completed_steps={completed_steps}")
 
-
+    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     # training info
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -264,10 +277,7 @@ if __name__ == '__main__':
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.update(completed_steps)
-
-    for epoch in range(start_epoch, args.num_train_epochs):
 
     # save model with best metric
     metric, mode = 'loss', -1
@@ -280,7 +290,7 @@ if __name__ == '__main__':
     os.makedirs(best_metric_dir, exist_ok=True)
 
     # train loop
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(start_epoch, args.num_train_epochs):
         train_loss = []
         prompt_encoder.train()
         # train
@@ -301,7 +311,7 @@ if __name__ == '__main__':
             train_loss.append(float(loss))
 
             # optim step
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+            if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 if args.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(prompt_encoder.parameters(), args.max_grad_norm)
 
@@ -355,6 +365,7 @@ if __name__ == '__main__':
         del train_loss, batch
 
         # valid
+        evaluator = RecEvaluator()
         valid_loss = []
         prompt_encoder.eval()
         for batch in tqdm(valid_dataloader):
