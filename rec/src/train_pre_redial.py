@@ -30,6 +30,7 @@ def _sigusr1_handler(signum, frame):
     _should_exit = True
 
 signal.signal(signal.SIGUSR1, _sigusr1_handler)
+signal.signal(signal.SIGTERM, _sigusr1_handler)
 
 def get_latest_ckpt(output_dir: str):
     p = Path(output_dir)
