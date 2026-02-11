@@ -61,7 +61,6 @@ srun --output="${outfile}" --error="${errfile}" \
       --save_steps 1000 \
       --save_total_limit 3 \
       --num_train_epochs 10 \
-      --max_train_steps 1000 \
   &
 
 SRUN_PID=$!
