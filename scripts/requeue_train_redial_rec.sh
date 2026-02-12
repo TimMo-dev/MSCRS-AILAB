@@ -10,7 +10,7 @@ WORKDIR="/ceph/project/rtm-p10/MSCRS-main"
 cd "$WORKDIR"
 
 outfile="${SLURM_JOB_ID}_rec_training.out"
-errfile="${SLURM_JOB_ID}_.rec_training.err"
+errfile="${SLURM_JOB_ID}_rec_training.err"
 
 # Launch training
 srun --output="${outfile}" --error="${errfile}" \
@@ -23,8 +23,7 @@ srun --output="${outfile}" --error="${errfile}" \
       --model     /home/weiyibiao/MSCRS-main/hf_models/DialoGPT-small \
       --text_tokenizer /home/weiyibiao/MSCRS-main/hf_models/roberta-base \
       --text_encoder   /home/weiyibiao/MSCRS-main/hf_models/roberta-base \
-      --output_dir "$OUTDIR" \
+      --output_dir /home/weiyibiao/MSCRS-main/redial_run1 \
       --resume_from latest \
-      --save_steps 1000 \
       --save_total_limit 3 \
       --num_train_epochs 10 \
