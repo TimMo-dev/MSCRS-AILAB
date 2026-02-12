@@ -19,7 +19,53 @@ from dataset_rec_copy import CRSRecDataset, CRSRecDataCollator
 from evaluate_rec import RecEvaluator
 from model_gpt2 import PromptGPT2forCRS
 from model_prompt import MMPrompt
+import json
+import re
+from pathlib import Path
 
+def _save_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def _load_json(path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _sorted_epoch_ckpts(ckpt_root: Path):
+    # checkpoint dirs look like epoch_0, epoch_1, ...
+    epoch_dirs = []
+    for p in ckpt_root.glob("epoch_*"):
+        m = re.match(r"epoch_(\d+)$", p.name)
+        if m and p.is_dir():
+            epoch_dirs.append((int(m.group(1)), p))
+    return [p for _, p in sorted(epoch_dirs, key=lambda x: x[0])]
+
+def prune_checkpoints(ckpt_root: Path, save_total_limit: int, logger=None):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+    ckpts = _sorted_epoch_ckpts(ckpt_root)
+    if len(ckpts) <= save_total_limit:
+        return
+    to_delete = ckpts[: len(ckpts) - save_total_limit]
+    for p in to_delete:
+        try:
+            # delete directory tree
+            for child in p.rglob("*"):
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+            for child in sorted([x for x in p.rglob("*") if x.is_dir()], reverse=True):
+                child.rmdir()
+            p.rmdir()
+            if logger:
+                logger.info(f"Pruned old checkpoint: {p}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to prune {p}: {e}")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -55,6 +101,10 @@ def parse_args():
     parser.add_argument("--project", type=str, help="wandb exp project")
     parser.add_argument("--name", type=str, help="wandb exp name")
     parser.add_argument("--log_all", action="store_true", help="log in all processes, otherwise only in rank0")
+    parser.add_argument("--save_each_epoch", action="store_true", help="Save a checkpoint at end of every epoch.")
+    parser.add_argument("--save_total_limit", type=int, default=5, help="Max number of epoch checkpoints to keep.")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to a checkpoint dir, or 'latest' to resume from output_dir/checkpoints/latest.")
     args = parser.parse_args()
     return args
 
@@ -91,6 +141,12 @@ if __name__ == '__main__':
         set_seed(args.seed)
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    ckpt_root = Path(args.output_dir) / "checkpoints"
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    latest_ptr = ckpt_root / "latest_path.json"  # stores {"path": "..."} for portability
+    train_state_path = ckpt_root / "train_state.json"
+
     kg = DBpedia(dataset=args.dataset, debug=args.debug).get_entity_kg_info()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     tokenizer.add_special_tokens(gpt2_special_tokens_dict)
@@ -182,6 +238,32 @@ if __name__ == '__main__':
     prompt_encoder, optimizer, train_dataloader, valid_dataloader, test_dataloader = accelerator.prepare(
         prompt_encoder, optimizer, train_dataloader, valid_dataloader, test_dataloader
     )
+
+    # ---- Resume (must happen AFTER accelerator.prepare so wrapped objects get loaded correctly) ----
+    start_epoch = 0
+    if args.resume_from:
+        if args.resume_from == "latest":
+            latest = _load_json(latest_ptr, default=None)
+            if latest and "path" in latest:
+                resume_path = Path(latest["path"])
+            else:
+                resume_path = None
+        else:
+            resume_path = Path(args.resume_from)
+
+        if resume_path and resume_path.exists():
+            accelerator.print(f"Resuming from checkpoint: {resume_path}")
+            accelerator.load_state(str(resume_path))
+
+            # restore our bookkeeping (epoch counters, best metric, completed steps)
+            st = _load_json(resume_path / "train_state.json", default={})
+            start_epoch = int(st.get("epoch", -1)) + 1
+            completed_steps = int(st.get("completed_steps", 0))
+            best_metric = st.get("best_metric", best_metric)
+            accelerator.print(f"Resumed: start_epoch={start_epoch}, completed_steps={completed_steps}, best_metric={best_metric}")
+        else:
+            accelerator.print("resume_from was set, but no valid checkpoint was found. Starting fresh.")
+
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -203,6 +285,8 @@ if __name__ == '__main__':
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    if completed_steps > 0:
+        progress_bar.update(completed_steps)
 
     metric, mode = 'loss', -1
     assert mode in (-1, 1)
@@ -326,6 +410,31 @@ if __name__ == '__main__':
         if run:
             run.log(test_report)
         evaluator.reset_metric()
+        
+        # ---- Save checkpoint each epoch ----
+        if args.save_each_epoch:
+            epoch_ckpt_dir = ckpt_root / f"epoch_{epoch}"
+            epoch_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save accelerator state (prompt_encoder + optimizer + scheduler + RNG, etc.)
+            accelerator.save_state(str(epoch_ckpt_dir))
+
+            # Save our bookkeeping next to it
+            _save_json(epoch_ckpt_dir / "train_state.json", {
+                "epoch": epoch,
+                "completed_steps": completed_steps,
+                "best_metric": best_metric,
+            })
+
+            # Update "latest" pointer
+            _save_json(latest_ptr, {"path": str(epoch_ckpt_dir)})
+
+            # Prune old checkpoints
+            if accelerator.is_local_main_process:
+                prune_checkpoints(ckpt_root, args.save_total_limit, logger=logger)
+
+            logger.info(f"Saved epoch checkpoint: {epoch_ckpt_dir}")
+
 
     final_dir = os.path.join(args.output_dir, 'final')
     prompt_encoder.save(final_dir)
