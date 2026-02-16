@@ -369,7 +369,7 @@ if __name__ == '__main__':
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     if completed_steps > 0:
-    progress_bar.update(completed_steps)
+        progress_bar.update(completed_steps)
 
     if mode == 1:
         best_metric = 0
