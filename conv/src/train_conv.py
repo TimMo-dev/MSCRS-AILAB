@@ -203,7 +203,7 @@ if __name__ == '__main__':
         prompt_encoder.load(args.prompt_encoder)
         logger.info(f"Loaded prompt encoder from {args.prompt_encoder}")
 
-prompt_encoder = prompt_encoder.to(device)
+    prompt_encoder = prompt_encoder.to(device)
     init_wandb_run(project_name=PROJECT_NAME,
                    dataset = args.dataset,
                    task = GENERATION,
