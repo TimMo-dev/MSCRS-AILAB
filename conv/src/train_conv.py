@@ -174,8 +174,8 @@ if __name__ == '__main__':
     latest_ptr = ckpt_root / "latest_path.json"
     kg = DBpedia(dataset=args.dataset, debug=args.debug).get_entity_kg_info()
     co = Co_occurrence(dataset=args.dataset, split='train', debug=args.debug ,all_items = kg['item_ids'],entity_max_length=args.entity_max_length,n_entity=kg['num_entities'] ).get_entity_co_info()
-    text_simi  = text_sim(pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
-    image_simi = image_sim(pad_entity_id=kg['pad_entity_id']).get_entity_is_info()    
+    text_simi  = text_sim(args.dataset,pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
+    image_simi = image_sim(args.dataset,pad_entity_id=kg['pad_entity_id']).get_entity_is_info()    
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     tokenizer.add_special_tokens(gpt2_special_tokens_dict)
     model = AutoModelForCausalLM.from_pretrained(args.model)
