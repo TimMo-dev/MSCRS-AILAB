@@ -138,7 +138,8 @@ if __name__ == '__main__':
     accelerator = Accelerator(device_placement=False)
 
     signal.signal(signal.SIGTERM, _handle_requeue_signal)
-    signal.signal(signal.SIGUSR1, _handle_requeue_signal)device = accelerator.device
+    signal.signal(signal.SIGUSR1, _handle_requeue_signal)
+    device = accelerator.device
 
     local_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     logger.remove()
