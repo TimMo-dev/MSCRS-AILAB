@@ -25,6 +25,58 @@ from transformers import AutoModel, AutoTokenizer, RobertaForMaskedLM
 from transformers import GPT2LMHeadModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
+import json
+import re
+import signal
+from pathlib import Path
+
+_REQUEUE_REQUESTED = False
+
+def _handle_requeue_signal(signum, frame):
+    global _REQUEUE_REQUESTED
+    _REQUEUE_REQUESTED = True
+
+def _save_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def _load_json(path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _sorted_epoch_ckpts(ckpt_root: Path):
+    epoch_dirs = []
+    for p in ckpt_root.glob("epoch_*"):
+        m = re.match(r"epoch_(\d+)$", p.name)
+        if m and p.is_dir():
+            epoch_dirs.append((int(m.group(1)), p))
+    return [p for _, p in sorted(epoch_dirs, key=lambda x: x[0])]
+
+def prune_checkpoints(ckpt_root: Path, save_total_limit: int, logger=None):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+    ckpts = _sorted_epoch_ckpts(ckpt_root)
+    if len(ckpts) <= save_total_limit:
+        return
+    to_delete = ckpts[: len(ckpts) - save_total_limit]
+    for p in to_delete:
+        try:
+            for child in p.rglob("*"):
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+            for child in sorted([x for x in p.rglob("*") if x.is_dir()], reverse=True):
+                child.rmdir()
+            p.rmdir()
+            if logger:
+                logger.info(f"Pruned old checkpoint: {p}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to prune {p}: {e}")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -70,6 +122,12 @@ def parse_args():
     parser.add_argument("--name", type=str, help="wandb exp name")
     parser.add_argument("--log_all", action="store_true", help="log in all processes, otherwise only in rank0")
     parser.add_argument('--type_of_run', default='training', help='type of the experiment, eg: full, ablation, analysis')
+    parser.add_argument("--save_each_epoch", action="store_true", help="Save a checkpoint at end of every epoch.")
+    parser.add_argument("--save_total_limit", type=int, default=3, help="Max number of epoch checkpoints to keep.")
+    parser.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a checkpoint dir, or 'latest' to resume from output_dir/checkpoints/latest_path.json.")
+    parser.add_argument("--save_on_signal", action="store_true",
+                    help="If set, save a checkpoint and exit on SIGTERM/SIGUSR1 (for Slurm requeue).")
     args = parser.parse_args()
     return args
 
@@ -78,7 +136,10 @@ if __name__ == '__main__':
     args = parse_args()
     config = vars(args)
     accelerator = Accelerator(device_placement=False)
-    device = accelerator.device
+
+    signal.signal(signal.SIGTERM, _handle_requeue_signal)
+    signal.signal(signal.SIGUSR1, _handle_requeue_signal)device = accelerator.device
+
     local_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     logger.remove()
     logger.add(sys.stderr, level='DEBUG' if accelerator.is_local_main_process else 'ERROR')
@@ -107,6 +168,9 @@ if __name__ == '__main__':
         set_seed(args.seed)
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
+    ckpt_root = Path(args.output_dir) / "checkpoints"
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    latest_ptr = ckpt_root / "latest_path.json"
     kg = DBpedia(dataset=args.dataset, debug=args.debug).get_entity_kg_info()
     co = Co_occurrence(dataset=args.dataset, split='train', debug=args.debug ,all_items = kg['item_ids'],entity_max_length=args.entity_max_length,n_entity=kg['num_entities'] ).get_entity_co_info()
     text_simi  = text_sim(pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
@@ -134,6 +198,11 @@ if __name__ == '__main__':
         n_examples= args.n_examples
     )
 
+    if args.prompt_encoder:
+        prompt_encoder.load(args.prompt_encoder)
+        logger.info(f"Loaded prompt encoder from {args.prompt_encoder}")
+
+prompt_encoder = prompt_encoder.to(device)
     init_wandb_run(project_name=PROJECT_NAME,
                    dataset = args.dataset,
                    task = GENERATION,
@@ -234,8 +303,8 @@ if __name__ == '__main__':
     )
     gen_file_path = os.path.join('log', f'gen_{local_time}.jsonl')
     evaluator = ConvEvaluator(tokenizer=tokenizer, log_file_path=gen_file_path)
-    model, prompt_encoder, optimizer, train_dataloader = accelerator.prepare(model, prompt_encoder, optimizer, train_dataloader)
-
+    #model, prompt_encoder, optimizer, train_dataloader = accelerator.prepare(model, prompt_encoder, optimizer, train_dataloader)
+    model, prompt_encoder, text_encoder, optimizer, train_dataloader = accelerator.prepare(model, prompt_encoder, text_encoder, optimizer, train_dataloader)
     # step, epoch, batch size
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -247,6 +316,47 @@ if __name__ == '__main__':
     # lr_scheduler
     lr_scheduler = get_linear_schedule_with_warmup(optimizer, args.num_warmup_steps, args.max_train_steps)
     lr_scheduler = accelerator.prepare(lr_scheduler)
+    start_epoch = 0
+
+    def save_checkpoint(tag: str, epoch: int, completed_steps: int, best_metric: float):
+        accelerator.wait_for_everyone()
+        ckpt_dir = ckpt_root / tag
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        accelerator.save_state(str(ckpt_dir))
+        _save_json(ckpt_dir / "train_state.json", {
+            "epoch": epoch,
+            "completed_steps": completed_steps,
+            "best_metric": best_metric,
+        })
+
+        if accelerator.is_local_main_process:
+            _save_json(latest_ptr, {"path": str(ckpt_dir)})
+            prune_checkpoints(ckpt_root, args.save_total_limit, logger=logger)
+
+        accelerator.wait_for_everyone()
+
+    # ---- Resume ----
+    if args.resume_from:
+        if args.resume_from == "latest":
+            latest = _load_json(latest_ptr, default=None)
+            resume_path = Path(latest["path"]) if latest and "path" in latest else None
+        else:
+            resume_path = Path(args.resume_from)
+
+        if resume_path and resume_path.exists():
+            accelerator.print(f"Resuming from checkpoint: {resume_path}")
+            accelerator.load_state(str(resume_path))
+
+            st = _load_json(resume_path / "train_state.json", default={})
+            start_epoch = int(st.get("epoch", -1)) + 1
+            completed_steps = int(st.get("completed_steps", 0))
+            best_metric = st.get("best_metric", best_metric)
+
+            accelerator.print(f"Resumed: start_epoch={start_epoch}, completed_steps={completed_steps}, best_metric={best_metric}")
+        else:
+            accelerator.print("resume_from was set, but no valid checkpoint was found. Starting fresh.")
+
     # training info
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -257,10 +367,9 @@ if __name__ == '__main__':
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    if completed_steps > 0:
+    progress_bar.update(completed_steps)
 
-    # save model with best metric
-    metric, mode = 'dist@4', 1
-    assert mode in (-1, 1)
     if mode == 1:
         best_metric = 0
     else:
@@ -269,7 +378,7 @@ if __name__ == '__main__':
     os.makedirs(best_metric_dir, exist_ok=True)
 
     # train loop
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(start_epoch, args.num_train_epochs):
         train_loss = []
         model.train()
         for step, batch in enumerate(train_dataloader):
@@ -313,7 +422,11 @@ if __name__ == '__main__':
             
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 if args.max_grad_norm is not None:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    params = []
+                    for pg in optimizer.param_groups:
+                        params.extend(pg["params"])
+                    accelerator.clip_grad_norm_(params, args.max_grad_norm)
+
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -322,6 +435,13 @@ if __name__ == '__main__':
                 # prompt_optimizer.zero_grad()
                 progress_bar.update(1)
                 completed_steps += 1
+
+                if args.save_on_signal and _REQUEUE_REQUESTED:
+                    if accelerator.is_local_main_process:
+                        logger.warning("SIGTERM/SIGUSR1 received. Saving requeue checkpoint and exiting...")
+                    save_checkpoint(tag="requeue_latest", epoch=epoch, completed_steps=completed_steps, best_metric=best_metric)
+                    raise SystemExit(0)
+
                 if run:
                     run.log({'loss': np.mean(train_loss) * args.gradient_accumulation_steps})
 
@@ -508,6 +628,10 @@ if __name__ == '__main__':
         evaluator.reset_metric()
 
         evaluator.log_cnt += 1
+        if args.save_each_epoch:
+            save_checkpoint(tag=f"epoch_{epoch}", epoch=epoch, completed_steps=completed_steps, best_metric=best_metric)
+            if accelerator.is_local_main_process:
+                logger.info(f"Saved epoch checkpoint: {ckpt_root / f'epoch_{epoch}'}")
 
     final_dir = os.path.join(args.output_dir, 'final')
     save(prompt_encoder, f"{final_dir}/prompt_encoder")
