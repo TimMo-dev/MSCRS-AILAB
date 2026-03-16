@@ -34,5 +34,6 @@ srun singularity exec --nv --cleanenv \
     --text_encoder   /home/weiyibiao/MSCRS-main/hf_models/roberta-base \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 6
-
+    --gradient_accumulation_steps 6 \
+    --num_bases 4 \
+    --fp16

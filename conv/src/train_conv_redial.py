@@ -18,7 +18,7 @@ from dataset_conv_retrieval_prompt import CRSConvDataCollator, CRSConvDataset
 from dataset_dbpedia import DBpedia ,Co_occurrence ,text_sim ,image_sim
 from evaluate_conv import ConvEvaluator
 from utils import init_wandb_run, GENERATION, PROJECT_NAME, MODEL_NAME, wandb_logging, freeze_model_params, count_parameters, save
-from model_prompt import MMPrompt
+from model_prompt_redial import MMPrompt
 from transformers import BartForConditionalGeneration, BartTokenizer, AdamW, WEIGHTS_NAME, CONFIG_NAME
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 from transformers import AutoModel, AutoTokenizer, RobertaForMaskedLM
@@ -84,7 +84,6 @@ def parse_args():
     parser.add_argument("--output_dir", type=str,default='./prompt-conv-inspired',help="Where to store the final model.")
     parser.add_argument("--debug", action='store_true', help="Debug mode.")
     parser.add_argument("--dataset", type=str, default='inspired', help="A file containing all data.")
-    parser.add_argument("--dry_run", action="store_true", help="Limit run to a tiny portion of the dataset for fast debugging.")
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--context_max_length', type=int,default=200 ,help="max length of both encoder and decoder input.")
     parser.add_argument('--resp_max_length', type=int,default=80, help="max length of decoder input.")
@@ -255,14 +254,6 @@ if __name__ == '__main__':
         prompt_tokenizer=text_tokenizer, prompt_max_length=args.prompt_max_length,
         n_examples=args.n_examples
     )
-
-    # Dry run mode: limit dataset sizes drastically for a very fast test
-    if args.dry_run:
-        import torch
-        train_dataset = torch.utils.data.Subset(train_dataset, range(20))
-        valid_dataset = torch.utils.data.Subset(valid_dataset, range(5))
-        test_dataset = torch.utils.data.Subset(test_dataset, range(5))
-    
     data_collator_teacher = CRSConvDataCollator(
         tokenizer=tokenizer, device=device, use_amp=accelerator.use_fp16, debug=args.debug, gen=False,
         ignore_pad_token_for_loss=args.ignore_pad_token_for_loss,
@@ -328,16 +319,6 @@ if __name__ == '__main__':
     lr_scheduler = accelerator.prepare(lr_scheduler)
     start_epoch = 0
 
-    # save model with best metric
-    metric, mode = 'dist@4', 1
-    assert mode in (-1, 1)
-    if mode == 1:
-        best_metric = 0.0
-    else:
-        best_metric = float('inf')
-    best_metric_dir = os.path.join(args.output_dir, 'best')
-    os.makedirs(best_metric_dir, exist_ok=True)
-
     def save_checkpoint(tag: str, epoch: int, completed_steps: int, best_metric: float):
         accelerator.wait_for_everyone()
         ckpt_dir = ckpt_root / tag
@@ -389,6 +370,13 @@ if __name__ == '__main__':
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     if completed_steps > 0:
         progress_bar.update(completed_steps)
+
+    if mode == 1:
+        best_metric = 0
+    else:
+        best_metric = float('inf')
+    best_metric_dir = os.path.join(args.output_dir, 'best')
+    os.makedirs(best_metric_dir, exist_ok=True)
 
     # train loop
     for epoch in range(start_epoch, args.num_train_epochs):
@@ -521,49 +509,16 @@ if __name__ == '__main__':
                 ### we directly feed the input embeddings through the generation model
                 batch['context']['inputs_embeds'] = prompt_augmented_input_embeddings
                 batch['context']['attention_mask'] = new_attention_mask
-
-                gen_input_ids = batch["context"]["input_ids"]
-                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-                import torch
-                # Robust conversion to tensor and shape check
-                if not torch.is_tensor(gen_input_ids):
-                    gen_input_ids = torch.as_tensor(gen_input_ids)
-                
-                # If gen_input_ids is a scalar or bool (can occur if batch has no data), convert to int64 tensor
-                if isinstance(gen_input_ids, (bool, int, float)) or gen_input_ids.ndim == 0:
-                    gen_input_ids = torch.tensor([gen_input_ids], dtype=torch.long)
-                
-                # LOG SHAPE FOR DEBUGGING (keep this for tracking oddities)
-                print(f"[DEBUG] gen_input_ids: type={type(gen_input_ids)}, shape={getattr(gen_input_ids, 'shape', None)}, dtype={getattr(gen_input_ids, 'dtype', None)}")
-                
-                # Robust attention mask: handles raw IDs as tensor/list/scalar
-                def safe_ids_to_attention_mask(ids, pad_token_id, device=None):
-                    import torch
-                    # Convert to tensor if not already, handle bool/scalar
-                    if not torch.is_tensor(ids):
-                        ids = torch.as_tensor(ids, dtype=torch.long)
-                    if isinstance(ids, bool) or (hasattr(ids, 'ndim') and ids.ndim == 0):
-                        ids = torch.as_tensor([ids], dtype=torch.long)
-                    # Ensure proper device
-                    if device is not None:
-                        ids = ids.to(device)
-                    mask = (ids != pad_token_id)
-                    mask = mask.long()
-                    return mask
-                gen_attention_mask = safe_ids_to_attention_mask(gen_input_ids, pad_id, getattr(gen_input_ids, 'device', None))
-
                 gen_seqs = accelerator.unwrap_model(model).generate(
-                    input_ids=gen_input_ids,
-                    attention_mask=gen_attention_mask,
+                    input_ids = None,
+                    inputs_embeds = batch['context']['inputs_embeds'],
                     max_new_tokens=args.max_gen_len,
-                    no_repeat_ngram_size=3,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
+                    no_repeat_ngram_size=3
                 )
                 gen_resp_ids = []
-                for gen_seq, ctx_len in zip(gen_seqs, batch["context_len"]):
-                    gen_seq = [t.item() for t in gen_seq if t != tokenizer.pad_token_id]
-                    gen_resp_ids.append(gen_seq[ctx_len:])  # only generated continuation
+                for gen_seq, length in zip(gen_seqs, batch['context_len']):
+                    gen_seq = [token_id.item() for token_id in gen_seq if token_id != tokenizer.pad_token_id]
+                    gen_resp_ids.append(gen_seq)
                     # gen_resp_ids.append(gen_seq[length:])
                 evaluator.evaluate(gen_resp_ids, batch['resp'], log=accelerator.is_local_main_process)
                 
@@ -641,57 +596,16 @@ if __name__ == '__main__':
                     attention_mask = batch['context']['attention_mask']
                 )
                 ### re-assign the new computed tensor to the input dictionary
-                #batch['context']['input_ids'] = None
+                batch['context']['input_ids'] = None
                 ### we directly feed the input embeddings through the generation model
                 batch['context']['inputs_embeds'] = prompt_augmented_input_embeddings
                 batch['context']['attention_mask'] = new_attention_mask
-
-                base_model = accelerator.unwrap_model(model)
-
-                attention_mask = batch['context']['attention_mask']
-                inputs_embeds = batch['context']['inputs_embeds']
-                batch_size = inputs_embeds.size(0)
-                device = inputs_embeds.device
-
-                generated = []
-
-                outputs = base_model.transformer(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    use_cache=True,
-                    return_dict=True,
+                gen_seqs = accelerator.unwrap_model(model).generate(
+                    input_ids = None,
+                    inputs_embeds = batch['context']['inputs_embeds'],
+                    max_new_tokens=args.max_gen_len,
+                    no_repeat_ngram_size=3
                 )
-
-                past_key_values = outputs.past_key_values
-                hidden_states = outputs.last_hidden_state
-                logits = base_model.lm_head(hidden_states)
-
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                generated.append(next_token)
-
-                for _ in range(args.max_gen_len - 1):
-
-                    new_mask = torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=device)
-                    attention_mask = torch.cat([attention_mask, new_mask], dim=1)
-
-                    outputs = base_model.transformer(
-                        input_ids=next_token,
-                        past_key_values=past_key_values,
-                        attention_mask=attention_mask,
-                        use_cache=True,
-                        return_dict=True,
-                    )
-
-                    past_key_values = outputs.past_key_values
-                    hidden_states = outputs.last_hidden_state
-                    logits = base_model.lm_head(hidden_states)
-
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                    generated.append(next_token)
-
-                gen_seqs = torch.cat(generated, dim=1)
-
                 gen_resp_ids = []
                 for gen_seq, length in zip(gen_seqs, batch['context_len']):
                     gen_seq = [token_id for token_id in gen_seq if token_id != tokenizer.pad_token_id]

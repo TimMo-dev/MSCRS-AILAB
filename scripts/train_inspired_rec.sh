@@ -9,23 +9,32 @@
 WORKDIR="/ceph/project/rtm-p10/MSCRS-main"
 cd "$WORKDIR"
 
-outfile="${SLURM_JOB_ID}_rec_training.out"
-errfile="${SLURM_JOB_ID}_rec_training.err"
+base_run_dir="train_runs/inspired_run"
+mkdir -p "$base_run_dir"
+
+current_iteration=1
+while [ -d "$base_run_dir/inspired_rec${current_iteration}" ]; do
+  current_iteration=$((current_iteration + 1))
+done
+
+inspired_rec_run_dir="$base_run_dir/inspired_rec${current_iteration}"
+mkdir -p "$inspired_rec_run_dir"
+
+outfile="${inspired_rec_run_dir}/${SLURM_JOB_ID}_inspired_rec_training.out"
+errfile="${inspired_rec_run_dir}/${SLURM_JOB_ID}_inspired_rec_training.err"
 
 # Launch training
 srun --output="${outfile}" --error="${errfile}" \
   singularity exec --nv --cleanenv \
     --bind "$(dirname "$WORKDIR"):/home/weiyibiao" \
     pytorch38_cu111_pyg.sif \
-    python /home/weiyibiao/MSCRS-main/rec/src/train_rec_redial.py \
-      --dataset /home/weiyibiao/MSCRS-main/data/rec_data/redial \
+    python /home/weiyibiao/MSCRS-main/rec/src/train_rec_inspired.py \
+      --dataset /home/weiyibiao/MSCRS-main/data/rec_data/inspired \
       --tokenizer /home/weiyibiao/MSCRS-main/hf_models/DialoGPT-small \
       --model     /home/weiyibiao/MSCRS-main/hf_models/DialoGPT-small \
       --text_tokenizer /home/weiyibiao/MSCRS-main/hf_models/roberta-base \
       --text_encoder   /home/weiyibiao/MSCRS-main/hf_models/roberta-base \
-      --prompt_encoder /home/weiyibiao/MSCRS-main/pretrain_run1/best \
-      --output_dir /home/weiyibiao/MSCRS-main/redial_run2 \
-      --resume_from latest \
-      --save_each_epoch \
-      --save_total_limit 3 \
+      --prompt_encoder /home/weiyibiao/MSCRS-main/train_runs/pretrain_run/pretrain_inspired6/best \
+      --output_dir "${inspired_rec_run_dir}" \
       --num_train_epochs 10
+

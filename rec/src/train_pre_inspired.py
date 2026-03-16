@@ -24,6 +24,7 @@ from model_prompt import MMPrompt_inspired
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
+    parser.add_argument("--dry_run", action='store_true', help="If set, only use a tiny subset of the data for a sanity check.")
     parser.add_argument("--output_dir", type=str, default='/home/weiyibiao//MSCRS-main/rec/src/pre-trained-inspired', help="Where to store the final model.")
     parser.add_argument("--debug", action='store_true', help="Debug mode.")
     parser.add_argument("--dataset", type=str, default='inspired', help="A file containing all data.")
@@ -109,8 +110,8 @@ if __name__ == '__main__':
         entity_max_length=args.entity_max_length
     )
     co = Co_occurrence(dataset=args.dataset, split='train', debug=args.debug ,all_items = kg['item_ids'],entity_max_length=args.entity_max_length,n_entity=kg['num_entities'] ).get_entity_co_info()
-    text_simi  = text_sim(pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
-    image_simi = image_sim(pad_entity_id=kg['pad_entity_id']).get_entity_is_info()
+    text_simi  = text_sim(args.dataset, pad_entity_id=kg['pad_entity_id']).get_entity_ts_info()
+    image_simi = image_sim(args.dataset, pad_entity_id=kg['pad_entity_id']).get_entity_is_info()
 
     valid_dataset = CRSDataset(
         dataset=args.dataset, split='valid', tokenizer=tokenizer, debug=args.debug, max_length=args.max_length,
@@ -122,6 +123,14 @@ if __name__ == '__main__':
         prompt_tokenizer=text_tokenizer, prompt_max_length=args.prompt_max_length,
         entity_max_length=args.entity_max_length
     )
+
+    # DRY RUN, drastically limit dataset sizes for fast debugging
+    if args.dry_run:
+        logger.info("Dry run mode enabled: slicing datasets to 10 samples each.")
+        train_dataset = train_dataset[:10]
+        valid_dataset = valid_dataset[:10]
+        test_dataset = test_dataset[:10]
+
     data_collator = CRSDataCollator_mm(
         tokenizer=tokenizer, device=device, pad_entity_id=kg['pad_entity_id'],
         max_length=args.max_length, entity_max_length=args.entity_max_length,
